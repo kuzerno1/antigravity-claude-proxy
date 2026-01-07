@@ -195,7 +195,7 @@ Add the proxy settings to your shell profile:
 
 ```bash
 echo 'export ANTHROPIC_BASE_URL="http://localhost:8080"' >> ~/.zshrc
-echo 'export ANTHROPIC_API_KEY="test"' >> ~/.zshrc
+echo 'export ANTHROPIC_AUTH_TOKEN="test"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -205,7 +205,7 @@ source ~/.zshrc
 
 ```powershell
 Add-Content $PROFILE "`n`$env:ANTHROPIC_BASE_URL = 'http://localhost:8080'"
-Add-Content $PROFILE "`$env:ANTHROPIC_API_KEY = 'test'"
+Add-Content $PROFILE "`$env:ANTHROPIC_AUTH_TOKEN = 'test'"
 . $PROFILE
 ```
 
@@ -213,7 +213,7 @@ Add-Content $PROFILE "`$env:ANTHROPIC_API_KEY = 'test'"
 
 ```cmd
 setx ANTHROPIC_BASE_URL "http://localhost:8080"
-setx ANTHROPIC_API_KEY "test"
+setx ANTHROPIC_AUTH_TOKEN "test"
 ```
 
 Restart your terminal for changes to take effect.
