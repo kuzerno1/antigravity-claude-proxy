@@ -230,6 +230,31 @@ claude
 
 > **Note:** If Claude Code asks you to select a login method, add `"hasCompletedOnboarding": true` to `~/.claude.json` (macOS/Linux) or `%USERPROFILE%\.claude.json` (Windows), then restart your terminal and try again.
 
+### Multiple Claude Code Instances (Optional)
+
+To run both the official Claude Code and Antigravity version simultaneously, add this alias:
+
+**macOS / Linux:**
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc
+alias claude-antigravity='CLAUDE_CONFIG_DIR=~/.claude-account-antigravity ANTHROPIC_BASE_URL="http://localhost:8080" ANTHROPIC_AUTH_TOKEN="test" command claude'
+```
+
+**Windows (PowerShell):**
+
+```powershell
+# Add to $PROFILE
+function claude-antigravity {
+    $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-account-antigravity"
+    $env:ANTHROPIC_BASE_URL = "http://localhost:8080"
+    $env:ANTHROPIC_AUTH_TOKEN = "test"
+    claude
+}
+```
+
+Then run `claude` for official API or `claude-antigravity` for this proxy.
+
 ---
 
 ## Available Models
