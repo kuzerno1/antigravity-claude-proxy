@@ -294,11 +294,51 @@ When you add multiple accounts, the proxy automatically:
 - **Automatic cooldown**: Rate-limited accounts become available after reset time expires
 - **Invalid account detection**: Accounts needing re-authentication are marked and skipped
 - **Prompt caching support**: Stable session IDs enable cache hits across conversation turns
+- **Soft limit protection**: Deprioritizes accounts below 10% quota to prevent 7-day reset timers
 
 Check account status anytime:
 
 ```bash
 curl "http://localhost:8080/account-limits?format=table"
+```
+
+---
+
+## Soft Limits
+
+Soft limits prevent accounts from being completely drained to 0% quota, which can trigger a 7-day reset timer instead of the shorter 5-hour timer.
+
+**How it works:**
+- When an account's quota drops below the threshold (default: 10%), it becomes "soft-limited"
+- The proxy prefers non-soft-limited accounts when making requests
+- If all accounts are soft-limited, the proxy still uses them (soft behavior, not hard block)
+- Quota is checked after each successful request to proactively detect low quota
+
+**Configuration:**
+
+```bash
+# Enabled by default at 10% threshold
+antigravity-claude-proxy start
+
+# Disable soft limits
+antigravity-claude-proxy start --no-soft-limit
+
+# Custom threshold (e.g., 15%)
+antigravity-claude-proxy start --soft-limit=15
+
+# Environment variables
+SOFT_LIMIT=false antigravity-claude-proxy start
+SOFT_LIMIT_THRESHOLD=0.15 antigravity-claude-proxy start
+```
+
+**Checking soft limit status:**
+
+```bash
+# View which accounts are soft-limited
+curl "http://localhost:8080/account-limits?format=table"
+
+# JSON format with soft limit details
+curl "http://localhost:8080/health"
 ```
 
 ---

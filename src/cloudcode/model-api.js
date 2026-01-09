@@ -2,9 +2,10 @@
  * Model API for Cloud Code
  *
  * Handles model listing and quota retrieval from the Cloud Code API.
+ * Includes soft limit checking to prevent quota exhaustion.
  */
 
-import { ANTIGRAVITY_ENDPOINT_FALLBACKS, ANTIGRAVITY_HEADERS, getModelFamily } from '../constants.js';
+import { ANTIGRAVITY_ENDPOINT_FALLBACKS, ANTIGRAVITY_HEADERS, getModelFamily, SOFT_LIMIT_THRESHOLD } from '../constants.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -109,4 +110,55 @@ export async function getModelQuotas(token) {
     }
 
     return quotas;
+}
+
+/**
+ * Check and update soft limit status for an account after a request.
+ * Fetches the current quota and updates the soft limit status if needed.
+ *
+ * This should be called after a successful request to proactively detect
+ * when an account's quota is running low before it's completely exhausted.
+ *
+ * @param {Object} account - Account object with email and credentials
+ * @param {string} modelId - Model ID that was used
+ * @param {string} token - OAuth access token for the account
+ * @param {import('../account-manager/index.js').default} accountManager - The account manager instance
+ * @returns {Promise<{checked: boolean, isSoftLimited: boolean, remainingFraction: number|null}>} Check result
+ */
+export async function checkAndUpdateSoftLimit(account, modelId, token, accountManager) {
+    // Skip if soft limits are disabled
+    if (!accountManager.isSoftLimitEnabled()) {
+        return { checked: false, isSoftLimited: false, remainingFraction: null };
+    }
+
+    try {
+        const quotas = await getModelQuotas(token);
+        const quota = quotas[modelId];
+
+        if (!quota || quota.remainingFraction === null) {
+            return { checked: true, isSoftLimited: false, remainingFraction: null };
+        }
+
+        const { changed, isSoftLimited } = accountManager.updateSoftLimitStatus(
+            account.email,
+            modelId,
+            quota.remainingFraction,
+            quota.resetTime
+        );
+
+        if (changed) {
+            const pct = Math.round(quota.remainingFraction * 100);
+            if (isSoftLimited) {
+                logger.warn(`[CloudCode] Account ${account.email} now soft-limited for ${modelId} at ${pct}%`);
+            } else {
+                logger.success(`[CloudCode] Account ${account.email} no longer soft-limited for ${modelId} (${pct}%)`);
+            }
+        }
+
+        return { checked: true, isSoftLimited, remainingFraction: quota.remainingFraction };
+    } catch (error) {
+        // Don't fail the request if quota check fails, just log and continue
+        logger.debug(`[CloudCode] Failed to check quota for soft limit: ${error.message}`);
+        return { checked: false, isSoftLimited: false, remainingFraction: null };
+    }
 }

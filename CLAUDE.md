@@ -20,6 +20,12 @@ npm start
 # Start with model fallback enabled (falls back to alternate model when quota exhausted)
 npm start -- --fallback
 
+# Start with soft limit disabled (default: enabled at 10%)
+npm start -- --no-soft-limit
+
+# Start with custom soft limit threshold (e.g., 15%)
+npm start -- --soft-limit=15
+
 # Start with debug logging
 npm start -- --debug
 
@@ -136,6 +142,21 @@ src/
 - Fallback is disabled on recursive calls to prevent infinite chains
 - Enable with `npm start -- --fallback` or `FALLBACK=true` environment variable
 
+**Soft Limits (--soft-limit flag):**
+- Prevents accounts from being drained to 0% quota to avoid triggering 7-day reset timers
+- When an account's quota drops below the threshold (default: 10%), it becomes "soft-limited"
+- Soft-limited accounts are deprioritized - the proxy prefers non-soft-limited accounts
+- If all accounts are soft-limited, the proxy still uses them (soft behavior, not hard block)
+- Quota is checked after each successful request to proactively detect low quota
+- Enabled by default at 10% threshold
+- Configuration options:
+  - `--no-soft-limit` - Disable soft limits entirely
+  - `--soft-limit=15` - Enable with custom threshold (percentage)
+  - `SOFT_LIMIT=false` - Disable via environment variable
+  - `SOFT_LIMIT_THRESHOLD=0.15` - Set threshold via environment variable (0.0-1.0 or 1-100)
+- Soft limit state is tracked per-model per-account in `account.modelSoftLimits[modelId]`
+- Status visible in `/health` and `/account-limits` endpoints
+
 **Cross-Model Thinking Signatures:**
 - Claude and Gemini use incompatible thinking signatures
 - When switching models mid-conversation, incompatible signatures are detected and dropped
@@ -167,6 +188,7 @@ src/
 - Model fallback mappings (`MODEL_FALLBACK_MAP`)
 - OAuth configuration
 - Rate limit thresholds
+- Soft limit threshold (`SOFT_LIMIT_THRESHOLD`)
 - Thinking model settings
 
 **Model Family Handling:**
