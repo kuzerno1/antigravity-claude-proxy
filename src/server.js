@@ -38,9 +38,9 @@ function parseSoftLimitConfig() {
     if (softLimitArg) {
         enabled = true;
         // Check if it has a value like --soft-limit=15
-        const match = softLimitArg.match(/--soft-limit=(\d+)/);
+        const match = softLimitArg.match(/--soft-limit=([\d.]+)/);
         if (match) {
-            const pct = parseInt(match[1], 10);
+            const pct = parseFloat(match[1]);
             if (pct >= 1 && pct <= 100) {
                 threshold = pct / 100; // Convert percentage to fraction
             }

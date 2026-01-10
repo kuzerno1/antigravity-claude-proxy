@@ -377,7 +377,7 @@ export function updateSoftLimitStatus(accounts, email, modelId, remainingFractio
     if (!account) return { changed: false, isSoftLimited: false };
 
     const wasSoftLimited = isSoftLimited(account, modelId, threshold);
-    const shouldBeSoftLimited = remainingFraction !== null && remainingFraction < threshold && remainingFraction > 0;
+    const shouldBeSoftLimited = remainingFraction !== null && remainingFraction < threshold && remainingFraction >= 0;
 
     if (shouldBeSoftLimited && !wasSoftLimited) {
         markSoftLimited(accounts, email, modelId, remainingFraction, resetTime, threshold);
