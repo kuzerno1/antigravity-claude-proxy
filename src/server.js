@@ -63,6 +63,57 @@ function parseSoftLimitConfig() {
 
 const SOFT_LIMIT_CONFIG = parseSoftLimitConfig();
 
+/**
+ * Check soft limits for all accounts on startup
+ * Fetches current quota and marks accounts below threshold as soft-limited
+ */
+async function checkInitialSoftLimits(accountManager, threshold) {
+    const allAccounts = accountManager.getAllAccounts();
+    const validAccounts = allAccounts.filter(a => !a.isInvalid);
+
+    if (validAccounts.length === 0) {
+        return { checked: 0, softLimited: 0 };
+    }
+
+    logger.info(`[Server] Checking initial quota for ${validAccounts.length} account(s)...`);
+
+    let softLimitedCount = 0;
+    const results = await Promise.allSettled(
+        validAccounts.map(async (account) => {
+            try {
+                const token = await accountManager.getTokenForAccount(account);
+                const quotas = await getModelQuotas(token);
+
+                let accountSoftLimited = false;
+                for (const [modelId, info] of Object.entries(quotas)) {
+                    if (info.remainingFraction !== null && info.remainingFraction < threshold) {
+                        accountManager.updateSoftLimitStatus(
+                            account.email,
+                            modelId,
+                            info.remainingFraction,
+                            info.resetTime
+                        );
+                        accountSoftLimited = true;
+                    }
+                }
+                return { email: account.email, softLimited: accountSoftLimited };
+            } catch (error) {
+                logger.warn(`[Server] Failed to check quota for ${account.email}: ${error.message}`);
+                return { email: account.email, error: error.message };
+            }
+        })
+    );
+
+    // Count successful soft-limited accounts
+    for (const result of results) {
+        if (result.status === 'fulfilled' && result.value.softLimited) {
+            softLimitedCount++;
+        }
+    }
+
+    return { checked: validAccounts.length, softLimited: softLimitedCount };
+}
+
 const app = express();
 
 // Initialize account manager (will be fully initialized on first request or startup)
@@ -94,6 +145,14 @@ async function ensureInitialized() {
             logger.success(`[Server] Account pool initialized: ${status.summary}`);
             if (SOFT_LIMIT_CONFIG.enabled) {
                 logger.info(`[Server] Soft limits enabled at ${Math.round(SOFT_LIMIT_CONFIG.threshold * 100)}% threshold`);
+
+                // Check initial soft limits on startup (non-blocking for server, but awaited for status)
+                const initialCheck = await checkInitialSoftLimits(accountManager, SOFT_LIMIT_CONFIG.threshold);
+                if (initialCheck.softLimited > 0) {
+                    logger.warn(`[Server] ${initialCheck.softLimited}/${initialCheck.checked} account(s) already below soft limit threshold`);
+                } else {
+                    logger.success(`[Server] All ${initialCheck.checked} account(s) above soft limit threshold`);
+                }
             } else {
                 logger.info('[Server] Soft limits disabled');
             }
