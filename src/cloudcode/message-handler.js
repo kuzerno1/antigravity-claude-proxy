@@ -19,6 +19,7 @@ import { parseResetTime } from './rate-limit-parser.js';
 import { buildCloudCodeRequest, buildHeaders } from './request-builder.js';
 import { parseThinkingSSEResponse } from './sse-parser.js';
 import { getFallbackModel } from '../fallback-config.js';
+import { checkAndUpdateSoftLimit } from './model-api.js';
 
 /**
  * Send a non-streaming request to Cloud Code with multi-account support
@@ -160,13 +161,19 @@ export async function sendMessage(anthropicRequest, accountManager, fallbackEnab
 
                     // For thinking models, parse SSE and accumulate all parts
                     if (isThinking) {
-                        return await parseThinkingSSEResponse(response, anthropicRequest.model);
+                        const result = await parseThinkingSSEResponse(response, anthropicRequest.model);
+                        // Check and update soft limit status after successful request (non-blocking)
+                        checkAndUpdateSoftLimit(account, model, token, accountManager).catch(() => {});
+                        return result;
                     }
 
                     // Non-thinking models use regular JSON
                     const data = await response.json();
                     logger.debug('[CloudCode] Response received');
-                    return convertGoogleToAnthropic(data, anthropicRequest.model);
+                    const result = convertGoogleToAnthropic(data, anthropicRequest.model);
+                    // Check and update soft limit status after successful request (non-blocking)
+                    checkAndUpdateSoftLimit(account, model, token, accountManager).catch(() => {});
+                    return result;
 
                 } catch (endpointError) {
                     if (isRateLimitError(endpointError)) {

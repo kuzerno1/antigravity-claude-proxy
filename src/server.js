@@ -8,14 +8,111 @@ import express from 'express';
 import cors from 'cors';
 import { sendMessage, sendMessageStream, listModels, getModelQuotas } from './cloudcode/index.js';
 import { forceRefresh } from './auth/token-extractor.js';
-import { REQUEST_BODY_LIMIT } from './constants.js';
+import { REQUEST_BODY_LIMIT, SOFT_LIMIT_THRESHOLD } from './constants.js';
 import { AccountManager } from './account-manager/index.js';
 import { formatDuration } from './utils/helpers.js';
 import { logger } from './utils/logger.js';
 
-// Parse fallback flag directly from command line args to avoid circular dependency
+// Parse command line args
 const args = process.argv.slice(2);
+
+// Fallback flag: --fallback or FALLBACK=true
 const FALLBACK_ENABLED = args.includes('--fallback') || process.env.FALLBACK === 'true';
+
+// Soft limit flags:
+// --soft-limit or --soft-limit=15 (percentage) to enable with optional threshold
+// --no-soft-limit to disable
+// SOFT_LIMIT=true/false and SOFT_LIMIT_THRESHOLD=0.15 environment variables
+function parseSoftLimitConfig() {
+    // Check for --no-soft-limit first (explicit disable)
+    if (args.includes('--no-soft-limit') || process.env.SOFT_LIMIT === 'false') {
+        return { enabled: false, threshold: SOFT_LIMIT_THRESHOLD };
+    }
+
+    // Default to enabled (soft limits on by default)
+    let enabled = true;
+    let threshold = SOFT_LIMIT_THRESHOLD;
+
+    // Check for --soft-limit or --soft-limit=XX
+    const softLimitArg = args.find(arg => arg.startsWith('--soft-limit'));
+    if (softLimitArg) {
+        enabled = true;
+        // Check if it has a value like --soft-limit=15
+        const match = softLimitArg.match(/--soft-limit=([\d.]+)/);
+        if (match) {
+            const pct = parseFloat(match[1]);
+            if (pct >= 1 && pct <= 100) {
+                threshold = pct / 100; // Convert percentage to fraction
+            }
+        }
+    }
+
+    // Environment variable for threshold
+    if (process.env.SOFT_LIMIT_THRESHOLD) {
+        const envThreshold = parseFloat(process.env.SOFT_LIMIT_THRESHOLD);
+        if (!isNaN(envThreshold) && envThreshold >= 0 && envThreshold <= 1) {
+            threshold = envThreshold;
+        } else if (!isNaN(envThreshold) && envThreshold >= 1 && envThreshold <= 100) {
+            // Support percentage format in env var too
+            threshold = envThreshold / 100;
+        }
+    }
+
+    return { enabled, threshold };
+}
+
+const SOFT_LIMIT_CONFIG = parseSoftLimitConfig();
+
+/**
+ * Check soft limits for all accounts on startup
+ * Fetches current quota and marks accounts below threshold as soft-limited
+ */
+async function checkInitialSoftLimits(accountManager, threshold) {
+    const allAccounts = accountManager.getAllAccounts();
+    const validAccounts = allAccounts.filter(a => !a.isInvalid);
+
+    if (validAccounts.length === 0) {
+        return { checked: 0, softLimited: 0 };
+    }
+
+    logger.info(`[Server] Checking initial quota for ${validAccounts.length} account(s)...`);
+
+    let softLimitedCount = 0;
+    const results = await Promise.allSettled(
+        validAccounts.map(async (account) => {
+            try {
+                const token = await accountManager.getTokenForAccount(account);
+                const quotas = await getModelQuotas(token);
+
+                let accountSoftLimited = false;
+                for (const [modelId, info] of Object.entries(quotas)) {
+                    if (info.remainingFraction !== null && info.remainingFraction < threshold) {
+                        accountManager.updateSoftLimitStatus(
+                            account.email,
+                            modelId,
+                            info.remainingFraction,
+                            info.resetTime
+                        );
+                        accountSoftLimited = true;
+                    }
+                }
+                return { email: account.email, softLimited: accountSoftLimited };
+            } catch (error) {
+                logger.warn(`[Server] Failed to check quota for ${account.email}: ${error.message}`);
+                return { email: account.email, error: error.message };
+            }
+        })
+    );
+
+    // Count successful soft-limited accounts
+    for (const result of results) {
+        if (result.status === 'fulfilled' && result.value.softLimited) {
+            softLimitedCount++;
+        }
+    }
+
+    return { checked: validAccounts.length, softLimited: softLimitedCount };
+}
 
 const app = express();
 
@@ -39,9 +136,26 @@ async function ensureInitialized() {
     initPromise = (async () => {
         try {
             await accountManager.initialize();
+
+            // Configure soft limits based on CLI flags / environment
+            accountManager.setSoftLimitEnabled(SOFT_LIMIT_CONFIG.enabled, SOFT_LIMIT_CONFIG.threshold);
+
             isInitialized = true;
             const status = accountManager.getStatus();
             logger.success(`[Server] Account pool initialized: ${status.summary}`);
+            if (SOFT_LIMIT_CONFIG.enabled) {
+                logger.info(`[Server] Soft limits enabled at ${Math.round(SOFT_LIMIT_CONFIG.threshold * 100)}% threshold`);
+
+                // Check initial soft limits on startup (non-blocking for server, but awaited for status)
+                const initialCheck = await checkInitialSoftLimits(accountManager, SOFT_LIMIT_CONFIG.threshold);
+                if (initialCheck.softLimited > 0) {
+                    logger.warn(`[Server] ${initialCheck.softLimited}/${initialCheck.checked} account(s) already below soft limit threshold`);
+                } else {
+                    logger.success(`[Server] All ${initialCheck.checked} account(s) above soft limit threshold`);
+                }
+            } else {
+                logger.info('[Server] Soft limits disabled');
+            }
         } catch (error) {
             initError = error;
             initPromise = null; // Allow retry on failure
@@ -143,6 +257,7 @@ app.get('/health', async (req, res) => {
                     email: account.email,
                     lastUsed: account.lastUsed ? new Date(account.lastUsed).toISOString() : null,
                     modelRateLimits: account.modelRateLimits || {},
+                    modelSoftLimits: account.modelSoftLimits || {},
                     rateLimitCooldownRemaining: soonestReset ? Math.max(0, soonestReset - Date.now()) : 0
                 };
 
@@ -206,10 +321,15 @@ app.get('/health', async (req, res) => {
             timestamp: new Date().toISOString(),
             latencyMs: Date.now() - start,
             summary: status.summary,
+            softLimit: {
+                enabled: status.softLimitEnabled,
+                threshold: `${Math.round(status.softLimitThreshold * 100)}%`
+            },
             counts: {
                 total: status.total,
                 available: status.available,
                 rateLimited: status.rateLimited,
+                softLimited: status.softLimited,
                 invalid: status.invalid
             },
             accounts: detailedAccounts
@@ -304,7 +424,12 @@ app.get('/account-limits', async (req, res) => {
 
             // Get account status info
             const status = accountManager.getStatus();
-            lines.push(`Accounts: ${status.total} total, ${status.available} available, ${status.rateLimited} rate-limited, ${status.invalid} invalid`);
+            lines.push(`Accounts: ${status.total} total, ${status.available} available, ${status.rateLimited} rate-limited, ${status.softLimited} soft-limited, ${status.invalid} invalid`);
+            if (status.softLimitEnabled) {
+                lines.push(`Soft limit: enabled at ${Math.round(status.softLimitThreshold * 100)}% threshold`);
+            } else {
+                lines.push('Soft limit: disabled');
+            }
             lines.push('');
 
             // Table 1: Account status
@@ -380,6 +505,11 @@ app.get('/account-limits', async (req, res) => {
                 let row = modelId.padEnd(modelColWidth);
                 for (const acc of accountLimits) {
                     const quota = acc.models?.[modelId];
+                    // Check if this account/model is soft-limited
+                    const accountData = status.accounts.find(a => a.email === acc.email);
+                    const softLimit = accountData?.modelSoftLimits?.[modelId];
+                    const isSoftLimited = softLimit?.isSoftLimited && (!softLimit.resetTime || softLimit.resetTime > Date.now());
+
                     let cell;
                     if (acc.status !== 'ok' && acc.status !== 'rate-limited') {
                         cell = `[${acc.status}]`;
@@ -399,7 +529,8 @@ app.get('/account-limits', async (req, res) => {
                         }
                     } else {
                         const pct = Math.round(quota.remainingFraction * 100);
-                        cell = `${pct}%`;
+                        // Add soft limit indicator
+                        cell = isSoftLimited ? `${pct}% [soft]` : `${pct}%`;
                     }
                     row += cell.padEnd(accountColWidth);
                 }

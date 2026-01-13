@@ -18,6 +18,7 @@ import { parseResetTime } from './rate-limit-parser.js';
 import { buildCloudCodeRequest, buildHeaders } from './request-builder.js';
 import { streamSSEResponse } from './sse-streamer.js';
 import { getFallbackModel } from '../fallback-config.js';
+import { checkAndUpdateSoftLimit } from './model-api.js';
 import crypto from 'crypto';
 
 /**
@@ -163,6 +164,8 @@ export async function* sendMessageStream(anthropicRequest, accountManager, fallb
                         try {
                             yield* streamSSEResponse(currentResponse, anthropicRequest.model);
                             logger.debug('[CloudCode] Stream completed');
+                            // Check and update soft limit status after successful stream (non-blocking)
+                            checkAndUpdateSoftLimit(account, model, token, accountManager).catch(() => {});
                             return;
                         } catch (streamError) {
                             // Only retry on EmptyResponseError

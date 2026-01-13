@@ -4,7 +4,7 @@
  * automatic failover, and smart cooldown for rate-limited accounts.
  */
 
-import { ACCOUNT_CONFIG_PATH } from '../constants.js';
+import { ACCOUNT_CONFIG_PATH, SOFT_LIMIT_THRESHOLD } from '../constants.js';
 import { loadAccounts, loadDefaultAccount, saveAccounts } from './storage.js';
 import {
     isAllRateLimited as checkAllRateLimited,
@@ -14,7 +14,15 @@ import {
     resetAllRateLimits as resetLimits,
     markRateLimited as markLimited,
     markInvalid as markAccountInvalid,
-    getMinWaitTimeMs as getMinWait
+    getMinWaitTimeMs as getMinWait,
+    // Soft limit functions
+    isSoftLimited as checkSoftLimited,
+    isAllSoftLimited as checkAllSoftLimited,
+    getPreferredAccounts as getPreferred,
+    markSoftLimited as markSoftLim,
+    clearSoftLimit as clearSoftLim,
+    clearExpiredSoftLimits as clearExpiredSoftLims,
+    updateSoftLimitStatus as updateSoftLimStatus
 } from './rate-limits.js';
 import {
     getTokenForAccount as fetchToken,
@@ -36,6 +44,8 @@ export class AccountManager {
     #configPath;
     #settings = {};
     #initialized = false;
+    #softLimitEnabled = true; // Whether soft limits are active
+    #softLimitThreshold = SOFT_LIMIT_THRESHOLD; // Configurable threshold
 
     // Per-account caches
     #tokenCache = new Map(); // email -> { token, extractedAt }
@@ -43,6 +53,35 @@ export class AccountManager {
 
     constructor(configPath = ACCOUNT_CONFIG_PATH) {
         this.#configPath = configPath;
+    }
+
+    /**
+     * Enable or disable soft limits
+     * @param {boolean} enabled - Whether to enable soft limits
+     * @param {number} [threshold] - Optional custom threshold (0.0-1.0)
+     */
+    setSoftLimitEnabled(enabled, threshold = null) {
+        this.#softLimitEnabled = enabled;
+        if (threshold !== null && threshold >= 0 && threshold <= 1) {
+            this.#softLimitThreshold = threshold;
+        }
+        logger.info(`[AccountManager] Soft limits ${enabled ? 'enabled' : 'disabled'}${enabled && threshold !== null ? ` at ${Math.round(threshold * 100)}% threshold` : ''}`);
+    }
+
+    /**
+     * Check if soft limits are enabled
+     * @returns {boolean} True if soft limits are enabled
+     */
+    isSoftLimitEnabled() {
+        return this.#softLimitEnabled;
+    }
+
+    /**
+     * Get the soft limit threshold
+     * @returns {number} Threshold fraction (0.0-1.0)
+     */
+    getSoftLimitThreshold() {
+        return this.#softLimitThreshold;
     }
 
     /**
@@ -106,11 +145,13 @@ export class AccountManager {
     }
 
     /**
-     * Clear expired rate limits
-     * @returns {number} Number of rate limits cleared
+     * Clear expired rate limits (and soft limits)
+     * @returns {number} Number of limits cleared
      */
     clearExpiredLimits() {
-        const cleared = clearLimits(this.#accounts);
+        const clearedRate = clearLimits(this.#accounts);
+        const clearedSoft = clearExpiredSoftLims(this.#accounts);
+        const cleared = clearedRate + clearedSoft;
         if (cleared > 0) {
             this.saveToDisk();
         }
@@ -129,11 +170,18 @@ export class AccountManager {
     /**
      * Pick the next available account (fallback when current is unavailable).
      * Sets activeIndex to the selected account's index.
+     * Respects soft limits if enabled.
      * @param {string} [modelId] - Optional model ID
      * @returns {Object|null} The next available account or null if none available
      */
     pickNext(modelId = null) {
-        const { account, newIndex } = selectNext(this.#accounts, this.#currentIndex, () => this.saveToDisk(), modelId);
+        const { account, newIndex } = selectNext(
+            this.#accounts,
+            this.#currentIndex,
+            () => this.saveToDisk(),
+            modelId,
+            this.#softLimitEnabled
+        );
         this.#currentIndex = newIndex;
         return account;
     }
@@ -165,11 +213,18 @@ export class AccountManager {
      * Prefers the current account for cache continuity, only switches when:
      * - Current account is rate-limited for > 2 minutes
      * - Current account is invalid
+     * - Current account is soft-limited AND preferred alternatives exist
      * @param {string} [modelId] - Optional model ID
      * @returns {{account: Object|null, waitMs: number}} Account to use and optional wait time
      */
     pickStickyAccount(modelId = null) {
-        const { account, waitMs, newIndex } = selectSticky(this.#accounts, this.#currentIndex, () => this.saveToDisk(), modelId);
+        const { account, waitMs, newIndex } = selectSticky(
+            this.#accounts,
+            this.#currentIndex,
+            () => this.saveToDisk(),
+            modelId,
+            this.#softLimitEnabled
+        );
         this.#currentIndex = newIndex;
         return { account, waitMs };
     }
@@ -269,16 +324,28 @@ export class AccountManager {
             );
         });
 
+        // Count accounts that have any active model-specific soft limits
+        const softLimited = this.#accounts.filter(a => {
+            if (!a.modelSoftLimits) return false;
+            return Object.values(a.modelSoftLimits).some(
+                limit => limit.isSoftLimited && (!limit.resetTime || limit.resetTime > Date.now())
+            );
+        });
+
         return {
             total: this.#accounts.length,
             available: available.length,
             rateLimited: rateLimited.length,
+            softLimited: softLimited.length,
             invalid: invalid.length,
-            summary: `${this.#accounts.length} total, ${available.length} available, ${rateLimited.length} rate-limited, ${invalid.length} invalid`,
+            softLimitEnabled: this.#softLimitEnabled,
+            softLimitThreshold: this.#softLimitThreshold,
+            summary: `${this.#accounts.length} total, ${available.length} available, ${rateLimited.length} rate-limited, ${softLimited.length} soft-limited, ${invalid.length} invalid`,
             accounts: this.#accounts.map(a => ({
                 email: a.email,
                 source: a.source,
                 modelRateLimits: a.modelRateLimits || {},
+                modelSoftLimits: a.modelSoftLimits || {},
                 isInvalid: a.isInvalid || false,
                 invalidReason: a.invalidReason || null,
                 lastUsed: a.lastUsed
@@ -301,6 +368,84 @@ export class AccountManager {
      */
     getAllAccounts() {
         return this.#accounts;
+    }
+
+    // ==================== Soft Limit Methods ====================
+
+    /**
+     * Check if an account is soft-limited for a model
+     * @param {string} email - Account email
+     * @param {string} modelId - Model ID
+     * @returns {boolean} True if account is soft-limited
+     */
+    isSoftLimited(email, modelId) {
+        const account = this.#accounts.find(a => a.email === email);
+        if (!account) return false;
+        return checkSoftLimited(account, modelId, this.#softLimitThreshold);
+    }
+
+    /**
+     * Check if all accounts are soft-limited for a model
+     * @param {string} modelId - Model ID
+     * @returns {boolean} True if all available accounts are soft-limited
+     */
+    isAllSoftLimited(modelId) {
+        return checkAllSoftLimited(this.#accounts, modelId, this.#softLimitThreshold);
+    }
+
+    /**
+     * Get preferred accounts (not soft-limited) for a model
+     * @param {string} [modelId] - Optional model ID
+     * @returns {Array<Object>} Array of preferred account objects
+     */
+    getPreferredAccounts(modelId = null) {
+        return getPreferred(this.#accounts, modelId, this.#softLimitThreshold);
+    }
+
+    /**
+     * Mark an account as soft-limited
+     * @param {string} email - Account email
+     * @param {string} modelId - Model ID
+     * @param {number} remainingFraction - Current remaining quota (0.0-1.0)
+     * @param {string|null} resetTime - ISO timestamp when quota resets
+     */
+    markSoftLimited(email, modelId, remainingFraction, resetTime = null) {
+        markSoftLim(this.#accounts, email, modelId, remainingFraction, resetTime, this.#softLimitThreshold);
+        this.saveToDisk();
+    }
+
+    /**
+     * Clear soft limit for an account/model
+     * @param {string} email - Account email
+     * @param {string} modelId - Model ID
+     */
+    clearSoftLimit(email, modelId) {
+        clearSoftLim(this.#accounts, email, modelId);
+        this.saveToDisk();
+    }
+
+    /**
+     * Update soft limit status based on quota info
+     * Automatically marks or clears soft limit based on remaining quota
+     * @param {string} email - Account email
+     * @param {string} modelId - Model ID
+     * @param {number} remainingFraction - Current remaining quota (0.0-1.0)
+     * @param {string|null} resetTime - ISO timestamp when quota resets
+     * @returns {{changed: boolean, isSoftLimited: boolean}} Whether status changed
+     */
+    updateSoftLimitStatus(email, modelId, remainingFraction, resetTime = null) {
+        const result = updateSoftLimStatus(
+            this.#accounts,
+            email,
+            modelId,
+            remainingFraction,
+            resetTime,
+            this.#softLimitThreshold
+        );
+        if (result.changed) {
+            this.saveToDisk();
+        }
+        return result;
     }
 }
 

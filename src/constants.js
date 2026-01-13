@@ -82,6 +82,10 @@ export const MAX_ACCOUNTS = 10; // Maximum number of accounts allowed
 // Rate limit wait thresholds
 export const MAX_WAIT_BEFORE_ERROR_MS = 120000; // 2 minutes - throw error if wait exceeds this
 
+// Soft limit configuration
+// When quota drops below this threshold, prefer other accounts to prevent 7-day reset timer
+export const SOFT_LIMIT_THRESHOLD = 0.10; // 10% - configurable via --soft-limit flag or SOFT_LIMIT_THRESHOLD env
+
 // Thinking model constants
 export const MIN_SIGNATURE_LENGTH = 50; // Minimum valid thinking signature length
 
@@ -175,6 +179,7 @@ export default {
     MAX_EMPTY_RESPONSE_RETRIES,
     MAX_ACCOUNTS,
     MAX_WAIT_BEFORE_ERROR_MS,
+    SOFT_LIMIT_THRESHOLD,
     MIN_SIGNATURE_LENGTH,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_SKIP_SIGNATURE,
